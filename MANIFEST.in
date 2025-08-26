@@ -1,2 +1,3 @@
 include g2p_en/homographs.en
-include g2p_en/checkpoint20.npz
+include g2p_en/g2p_encoder.onnx
+include g2p_en/g2p_decoder_step.onnx
