@@ -26,8 +26,11 @@ setup(
     'nltk>=3.2.4',
     'inflect>=0.3.1',
     'distance>=0.1.3',
-    'onnxruntime'
   ],
+  extras_require = {
+      "cpu": ["onnxruntime"],
+      "gpu": ["onnxruntime-gpu"],
+  },
   license='Apache Software License',
   include_package_data=True
 )

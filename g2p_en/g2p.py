@@ -41,7 +41,7 @@ def construct_homograph_dictionary():
     return homograph2features
 
 class G2p(object):
-    def __init__(self, onnx_dir=dirname):
+    def __init__(self, **kwargs):
         super().__init__()
         self.graphemes = ["<pad>", "<unk>", "</s>"] + list("abcdefghijklmnopqrstuvwxyz")
         self.phonemes = ["<pad>", "<unk>", "<s>", "</s>"] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
@@ -64,12 +64,12 @@ class G2p(object):
         
         # Load ONNX models
         self.encoder_session = onnxruntime.InferenceSession(
-            os.path.join(onnx_dir, 'g2p_encoder.onnx'),
-            providers=['CPUExecutionProvider']
+            os.path.join(dirname, 'g2p_encoder.onnx'),
+            **kwargs
         )
         self.decoder_session = onnxruntime.InferenceSession(
-            os.path.join(onnx_dir, 'g2p_decoder_step.onnx'),
-            providers=['CPUExecutionProvider']
+            os.path.join(dirname, 'g2p_decoder_step.onnx'),
+            **kwargs
         )
     
     def encode(self, word):
