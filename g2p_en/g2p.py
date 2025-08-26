@@ -10,6 +10,7 @@ import nltk
 from nltk.tokenize import TweetTokenizer
 word_tokenize = TweetTokenizer().tokenize
 import numpy as np
+import torch
 import codecs
 import re
 import os
@@ -181,6 +182,140 @@ class G2p(object):
             prons.extend([" "])
 
         return prons[:-1]
+
+
+class G2p_torch(object):
+    def __init__(self):
+        super().__init__()
+        self.graphemes = ["<pad>", "<unk>", "</s>"] + list("abcdefghijklmnopqrstuvwxyz")
+        self.phonemes = ["<pad>", "<unk>", "<s>", "</s>"] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
+                                                             'AO1', 'AO2', 'AW0', 'AW1', 'AW2', 'AY0', 'AY1', 'AY2', 'B', 'CH', 'D', 'DH',
+                                                             'EH0', 'EH1', 'EH2', 'ER0', 'ER1', 'ER2', 'EY0', 'EY1',
+                                                             'EY2', 'F', 'G', 'HH',
+                                                             'IH0', 'IH1', 'IH2', 'IY0', 'IY1', 'IY2', 'JH', 'K', 'L',
+                                                             'M', 'N', 'NG', 'OW0', 'OW1',
+                                                             'OW2', 'OY0', 'OY1', 'OY2', 'P', 'R', 'S', 'SH', 'T', 'TH',
+                                                             'UH0', 'UH1', 'UH2', 'UW',
+                                                             'UW0', 'UW1', 'UW2', 'V', 'W', 'Y', 'Z', 'ZH']
+        self.g2idx = {g: idx for idx, g in enumerate(self.graphemes)}
+        self.idx2g = {idx: g for idx, g in enumerate(self.graphemes)}
+
+        self.p2idx = {p: idx for idx, p in enumerate(self.phonemes)}
+        self.idx2p = {idx: p for idx, p in enumerate(self.phonemes)}
+
+        self.cmu = cmudict.dict()
+        self.load_variables()
+        self.homograph2features = construct_homograph_dictionary()
+
+    def load_variables(self):
+        variables = np.load(os.path.join(dirname, 'checkpoint20.npz'))
+        self.enc_emb = torch.from_numpy(variables["enc_emb"]).float()
+        self.enc_w_ih = torch.from_numpy(variables["enc_w_ih"]).float()
+        self.enc_w_hh = torch.from_numpy(variables["enc_w_hh"]).float()
+        self.enc_b_ih = torch.from_numpy(variables["enc_b_ih"]).float()
+        self.enc_b_hh = torch.from_numpy(variables["enc_b_hh"]).float()
+
+        self.dec_emb = torch.from_numpy(variables["dec_emb"]).float()
+        self.dec_w_ih = torch.from_numpy(variables["dec_w_ih"]).float()
+        self.dec_w_hh = torch.from_numpy(variables["dec_w_hh"]).float()
+        self.dec_b_ih = torch.from_numpy(variables["dec_b_ih"]).float()
+        self.dec_b_hh = torch.from_numpy(variables["dec_b_hh"]).float()
+        self.fc_w = torch.from_numpy(variables["fc_w"]).float()
+        self.fc_b = torch.from_numpy(variables["fc_b"]).float()
+
+    def grucell(self, x, h, w_ih, w_hh, b_ih, b_hh):
+        rzn_ih = torch.matmul(x, w_ih.T) + b_ih
+        rzn_hh = torch.matmul(h, w_hh.T) + b_hh
+
+        rz_ih, n_ih = rzn_ih[:, :rzn_ih.shape[-1] * 2 // 3], rzn_ih[:, rzn_ih.shape[-1] * 2 // 3:]
+        rz_hh, n_hh = rzn_hh[:, :rzn_hh.shape[-1] * 2 // 3], rzn_hh[:, rzn_hh.shape[-1] * 2 // 3:]
+
+        rz = torch.sigmoid(rz_ih + rz_hh)
+        r, z = torch.chunk(rz, 2, -1)
+
+        n = torch.tanh(n_ih + r * n_hh)
+        h = (1 - z) * n + z * h
+
+        return h
+
+    def gru(self, x, steps, w_ih, w_hh, b_ih, b_hh, h0=None):
+        if h0 is None:
+            h0 = torch.zeros((x.shape[0], w_hh.shape[1]), dtype=torch.float32)
+        h = h0  # initial hidden state
+        outputs = torch.zeros((x.shape[0], steps, w_hh.shape[1]), dtype=torch.float32)
+        for t in range(steps):
+            h = self.grucell(x[:, t, :], h, w_ih, w_hh, b_ih, b_hh)  # (b, h)
+            outputs[:, t, ::] = h
+        return outputs
+
+    def encode(self, word):
+        chars = list(word) + ["</s>"]
+        x = [self.g2idx.get(char, self.g2idx["<unk>"]) for char in chars]
+        x = self.enc_emb[torch.LongTensor(x).unsqueeze(0)]
+
+        return x
+
+    def predict(self, word):
+        # encoder
+        enc = self.encode(word)
+        enc = self.gru(enc, len(word) + 1, self.enc_w_ih, self.enc_w_hh,
+                       self.enc_b_ih, self.enc_b_hh, h0=torch.zeros((1, self.enc_w_hh.shape[-1]), dtype=torch.float32))
+        last_hidden = enc[:, -1, :]
+
+        # decoder
+        dec = self.dec_emb[[2]]  # 2: <s>
+        h = last_hidden
+
+        preds = []
+        for i in range(20):
+            h = self.grucell(dec, h, self.dec_w_ih, self.dec_w_hh, self.dec_b_ih, self.dec_b_hh)  # (b, h)
+            logits = torch.matmul(h, self.fc_w.T) + self.fc_b
+            pred = logits.argmax()
+            pred_idx = pred.item()
+            if pred_idx == 3: break  # 3: </s>
+            preds.append(pred_idx)
+            dec = self.dec_emb[[pred_idx]]
+
+        preds = [self.idx2p.get(idx, "<unk>") for idx in preds]
+        return preds
+
+    def __call__(self, text):
+        # preprocessing
+        text = unicode(text)
+        text = normalize_numbers(text)
+        text = ''.join(char for char in unicodedata.normalize('NFD', text)
+                       if unicodedata.category(char) != 'Mn')  # Strip accents
+        text = text.lower()
+        text = re.sub("[^ a-z'.,?!\-]", "", text)
+        text = text.replace("i.e.", "that is")
+        text = text.replace("e.g.", "for example")
+
+        # tokenization
+        words = word_tokenize(text)
+        tokens = pos_tag(words)  # tuples of (word, tag)
+
+        # steps
+        prons = []
+        for word, pos in tokens:
+            if re.search("[a-z]", word) is None:
+                pron = [word]
+
+            elif word in self.homograph2features:  # Check homograph
+                pron1, pron2, pos1 = self.homograph2features[word]
+                if pos.startswith(pos1):
+                    pron = pron1
+                else:
+                    pron = pron2
+            elif word in self.cmu:  # lookup CMU dict
+                pron = self.cmu[word][0]
+            else: # predict for oov
+                pron = self.predict(word)
+
+            prons.extend(pron)
+            prons.extend([" "])
+
+        return prons[:-1]
+
 
 if __name__ == '__main__':
     texts = ["I have $250 in my pocket.", # number -> spell-out
