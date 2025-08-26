@@ -18,6 +18,11 @@ import unicodedata
 from builtins import str as unicode
 from .expand import normalize_numbers
 
+# For ONNX export and runtime
+import torch.nn as nn
+import onnxruntime
+import torch.onnx
+
 try:
     nltk.data.find('taggers/averaged_perceptron_tagger.zip')
 except LookupError:
@@ -317,13 +322,249 @@ class G2p_torch(object):
         return prons[:-1]
 
 
+class G2pEncoder(nn.Module):
+    def __init__(self, enc_emb, enc_w_ih, enc_w_hh, enc_b_ih, enc_b_hh):
+        super().__init__()
+        self.enc_emb = nn.Parameter(enc_emb, requires_grad=False)
+        self.gru = nn.GRU(input_size=enc_emb.shape[1], hidden_size=enc_w_hh.shape[1], batch_first=True)
+        
+        # Set GRU parameters manually
+        self.gru.weight_ih_l0.data = enc_w_ih
+        self.gru.weight_hh_l0.data = enc_w_hh
+        self.gru.bias_ih_l0.data = enc_b_ih
+        self.gru.bias_hh_l0.data = enc_b_hh
+    
+    def forward(self, input_ids):
+        # input_ids: (batch_size, seq_len)
+        x = self.enc_emb[input_ids]  # (batch_size, seq_len, emb_dim)
+        _, hidden = self.gru(x)  # hidden: (1, batch_size, hidden_dim)
+        return hidden.squeeze(0)  # (batch_size, hidden_dim)
+
+
+class G2pDecoderStep(nn.Module):
+    def __init__(self, dec_emb, dec_w_ih, dec_w_hh, dec_b_ih, dec_b_hh, fc_w, fc_b):
+        super().__init__()
+        self.dec_emb = nn.Parameter(dec_emb, requires_grad=False)
+        self.gru_cell = nn.GRUCell(input_size=dec_emb.shape[1], hidden_size=dec_w_hh.shape[1])
+        self.fc = nn.Linear(dec_w_hh.shape[1], fc_w.shape[0])
+        
+        # Set parameters manually
+        self.gru_cell.weight_ih.data = dec_w_ih
+        self.gru_cell.weight_hh.data = dec_w_hh
+        self.gru_cell.bias_ih.data = dec_b_ih
+        self.gru_cell.bias_hh.data = dec_b_hh
+        self.fc.weight.data = fc_w
+        self.fc.bias.data = fc_b
+    
+    def forward(self, input_id, hidden):
+        # input_id: (batch_size,) - single token
+        # hidden: (batch_size, hidden_dim)
+        x = self.dec_emb[input_id]  # (batch_size, emb_dim)
+        new_hidden = self.gru_cell(x, hidden)  # (batch_size, hidden_dim)
+        logits = self.fc(new_hidden)  # (batch_size, vocab_size)
+        return new_hidden, logits
+
+
+def export_onnx_models(g2p_torch_instance, export_dir=dirname):
+    import os
+    os.makedirs(export_dir, exist_ok=True)
+    
+    # Export encoder
+    encoder = G2pEncoder(
+        g2p_torch_instance.enc_emb,
+        g2p_torch_instance.enc_w_ih,
+        g2p_torch_instance.enc_w_hh,
+        g2p_torch_instance.enc_b_ih,
+        g2p_torch_instance.enc_b_hh
+    )
+    
+    # Example input for encoder (max length word)
+    dummy_input = torch.randint(0, len(g2p_torch_instance.graphemes), (1, 30))  # batch_size=1, max_len=30
+    
+    torch.onnx.export(
+        encoder,
+        dummy_input,
+        f"{export_dir}/g2p_encoder.onnx",
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=['input_ids'],
+        output_names=['hidden_state'],
+        dynamic_axes={'input_ids': {1: 'seq_len'}}  # Allow variable sequence length
+    )
+    
+    # Export decoder step
+    decoder_step = G2pDecoderStep(
+        g2p_torch_instance.dec_emb,
+        g2p_torch_instance.dec_w_ih,
+        g2p_torch_instance.dec_w_hh,
+        g2p_torch_instance.dec_b_ih,
+        g2p_torch_instance.dec_b_hh,
+        g2p_torch_instance.fc_w,
+        g2p_torch_instance.fc_b
+    )
+    
+    # Example inputs for decoder step
+    dummy_input_id = torch.randint(0, len(g2p_torch_instance.phonemes), (1,))  # batch_size=1
+    dummy_hidden = torch.randn(1, g2p_torch_instance.dec_w_hh.shape[1])  # batch_size=1, hidden_dim
+    
+    torch.onnx.export(
+        decoder_step,
+        (dummy_input_id, dummy_hidden),
+        f"{export_dir}/g2p_decoder_step.onnx",
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=['input_id', 'hidden_state'],
+        output_names=['new_hidden_state', 'logits']
+    )
+    
+    print(f"ONNX models exported to {export_dir}/")
+
+
+class G2pOnnx(object):
+    def __init__(self, onnx_dir=dirname):
+        super().__init__()
+        self.graphemes = ["<pad>", "<unk>", "</s>"] + list("abcdefghijklmnopqrstuvwxyz")
+        self.phonemes = ["<pad>", "<unk>", "<s>", "</s>"] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
+                                                             'AO1', 'AO2', 'AW0', 'AW1', 'AW2', 'AY0', 'AY1', 'AY2', 'B', 'CH', 'D', 'DH',
+                                                             'EH0', 'EH1', 'EH2', 'ER0', 'ER1', 'ER2', 'EY0', 'EY1',
+                                                             'EY2', 'F', 'G', 'HH',
+                                                             'IH0', 'IH1', 'IH2', 'IY0', 'IY1', 'IY2', 'JH', 'K', 'L',
+                                                             'M', 'N', 'NG', 'OW0', 'OW1',
+                                                             'OW2', 'OY0', 'OY1', 'OY2', 'P', 'R', 'S', 'SH', 'T', 'TH',
+                                                             'UH0', 'UH1', 'UH2', 'UW',
+                                                             'UW0', 'UW1', 'UW2', 'V', 'W', 'Y', 'Z', 'ZH']
+        self.g2idx = {g: idx for idx, g in enumerate(self.graphemes)}
+        self.idx2g = {idx: g for idx, g in enumerate(self.graphemes)}
+        
+        self.p2idx = {p: idx for idx, p in enumerate(self.phonemes)}
+        self.idx2p = {idx: p for idx, p in enumerate(self.phonemes)}
+        
+        self.cmu = cmudict.dict()
+        self.homograph2features = construct_homograph_dictionary()
+        
+        # Load ONNX models
+        self.encoder_session = onnxruntime.InferenceSession(
+            os.path.join(onnx_dir, 'g2p_encoder.onnx'),
+            providers=['CPUExecutionProvider']
+        )
+        self.decoder_session = onnxruntime.InferenceSession(
+            os.path.join(onnx_dir, 'g2p_decoder_step.onnx'),
+            providers=['CPUExecutionProvider']
+        )
+    
+    def encode(self, word):
+        chars = list(word) + ["</s>"]
+        x = [self.g2idx.get(char, self.g2idx["<unk>"]) for char in chars]
+        return np.array([x], dtype=np.int64)  # batch_size=1
+    
+    def predict(self, word):
+        # encoder
+        input_ids = self.encode(word)
+        hidden_state = self.encoder_session.run(['hidden_state'], {'input_ids': input_ids})[0]
+        
+        # decoder
+        current_token = np.array([2], dtype=np.int64)  # Start with <s> token
+        hidden = hidden_state.astype(np.float32)
+        
+        preds = []
+        for _ in range(20):  # max length
+            new_hidden, logits = self.decoder_session.run(
+                ['new_hidden_state', 'logits'],
+                {'input_id': current_token, 'hidden_state': hidden}
+            )
+            
+            pred_idx = np.argmax(logits, axis=1)[0]
+            if pred_idx == 3:  # </s> token
+                break
+                
+            preds.append(pred_idx)
+            current_token = np.array([pred_idx], dtype=np.int64)
+            hidden = new_hidden
+        
+        preds = [self.idx2p.get(idx, "<unk>") for idx in preds]
+        return preds
+    
+    def __call__(self, text):
+        # Same preprocessing as G2p_torch
+        text = unicode(text)
+        text = normalize_numbers(text)
+        text = ''.join(char for char in unicodedata.normalize('NFD', text)
+                       if unicodedata.category(char) != 'Mn')  # Strip accents
+        text = text.lower()
+        text = re.sub("[^ a-z'.,?!\\-]", "", text)
+        text = text.replace("i.e.", "that is")
+        text = text.replace("e.g.", "for example")
+
+        # tokenization
+        words = word_tokenize(text)
+        tokens = pos_tag(words)  # tuples of (word, tag)
+
+        # steps
+        prons = []
+        for word, pos in tokens:
+            if re.search("[a-z]", word) is None:
+                pron = [word]
+
+            elif word in self.homograph2features:  # Check homograph
+                pron1, pron2, pos1 = self.homograph2features[word]
+                if pos.startswith(pos1):
+                    pron = pron1
+                else:
+                    pron = pron2
+            elif word in self.cmu:  # lookup CMU dict
+                pron = self.cmu[word][0]
+            else: # predict for oov
+                pron = self.predict(word)
+
+            prons.extend(pron)
+            prons.extend([" "])
+
+        return prons[:-1]
+
+
 if __name__ == '__main__':
     texts = ["I have $250 in my pocket.", # number -> spell-out
              "popular pets, e.g. cats and dogs", # e.g. -> for example
              "I refuse to collect the refuse around here.", # homograph
              "I'm an activationist."] # newly coined word
+    
+    print("=== Testing original G2p (numpy) ===")
     g2p = G2p()
     for text in texts:
         out = g2p(text)
-        print(out)
+        print(f"Input: {text}")
+        print(f"Output: {out}\n")
+    
+    print("=== Testing G2p_torch ===")
+    g2p_torch = G2p_torch()
+    for text in texts:
+        out = g2p_torch(text)
+        print(f"Input: {text}")
+        print(f"Output: {out}\n")
+    
+    print("=== Exporting ONNX models ===")
+    export_onnx_models(g2p_torch)
+    
+    print("=== Testing G2pOnnx ===")
+    try:
+        g2p_onnx = G2pOnnx()
+        for text in texts:
+            out = g2p_onnx(text)
+            print(f"Input: {text}")
+            print(f"Output: {out}\n")
+        
+        # Test specific OOV word prediction comparison
+        test_word = "activationist"
+        torch_pred = g2p_torch.predict(test_word)
+        onnx_pred = g2p_onnx.predict(test_word)
+        print(f"=== Comparing predictions for '{test_word}' ===")
+        print(f"Torch: {torch_pred}")
+        print(f"ONNX:  {onnx_pred}")
+        print(f"Match: {torch_pred == onnx_pred}")
+        
+    except Exception as e:
+        print(f"ONNX test failed: {e}")
+        print("Make sure you have onnxruntime installed: pip install onnxruntime")
 
