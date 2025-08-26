@@ -1,7 +1,9 @@
 [![image](https://img.shields.io/pypi/v/g2p-en.svg)](https://pypi.org/project/g2p-en/)
 [![image](https://img.shields.io/pypi/l/g2p-en.svg)](https://pypi.org/project/g2p-en/)
 
-# g2pE: A Simple Python Module for English Grapheme To Phoneme Conversion
+# g2pE: A Simple Python Module for English Grapheme To Phoneme Conversion ONNX Version
+
+This is a fork from https://github.com/Kyubyong/g2p/tree/master to convert the Numpy usage into ONNX and ONNXRuntime. With full support of ONNXRuntime inference arguments.
 
 * [v.2.0] We removed TensorFlow from the dependencies. After all, it changes its APIs quite often, and we don't expect you to have a GPU. Instead, NumPy is used for inference.
 
@@ -40,12 +42,12 @@ In this project, we employ a deep learning seq2seq framework based on TensorFlow
 * python -m nltk.downloader "averaged_perceptron_tagger" "cmudict"
 * inflect >= 0.3.1
 * Distance >= 0.1.3
+* onnxruntime
 
 ## Installation
-
-    pip install g2p_en
+    pip install git+https://github.com/zpeng11/g2p-onnx[cpu] # or https://github.com/zpeng11/g2p-onnx[gpu]
 OR
-
+    pip install onnxruntime
     python setup.py install
 
 nltk package will be automatically downloaded at your first run.
@@ -59,7 +61,7 @@ nltk package will be automatically downloaded at your first run.
              "popular pets, e.g. cats and dogs", # e.g. -> for example
              "I refuse to collect the refuse around here.", # homograph
              "I'm an activationist."] # newly coined word
-    g2p = G2p()
+    g2p = G2p(providers=['CPUExecutionProvider']) # You can use any onnxruntime.InferenceSession supported arguments
     for text in texts:
         out = g2p(text)
         print(out)
